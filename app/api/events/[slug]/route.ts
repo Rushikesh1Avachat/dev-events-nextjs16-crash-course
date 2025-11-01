@@ -1,121 +1,83 @@
-import { NextResponse } from "next/server";
-import mongoose, { Model, Schema, Document } from "mongoose";
+import { NextRequest, NextResponse } from 'next/server';
 
-// Ensure this route runs on the Node.js runtime (MongoDB is not supported on the Edge runtime)
-export const runtime = "nodejs";
+import connectDB from '@/lib/mongodb';
+import Event, { IEvent } from '@/database/event.model';
 
-// Basic shape of the public event data we return
-export interface EventPublic {
-  image: string;
-  title: string;
-  slug: string;
-  location: string;
-  date: string; // ISO date string (e.g., "2025-11-07")
-  time: string; // Human-readable time (e.g., "09:00 AM")
-}
+// Define route params type for type safety
+type RouteParams = {
+  params: Promise<{
+    slug: string;
+  }>;
+};
 
-// Mongoose document type for the Event collection
-interface EventDoc extends Document, EventPublic {}
-
-// Define a minimal schema (will be reused if a model is already compiled)
-const EventSchema = new Schema<EventDoc>(
-  {
-    image: { type: String, required: true },
-    title: { type: String, required: true },
-    slug: { type: String, required: true, unique: true, index: true },
-    location: { type: String, required: true },
-    date: { type: String, required: true },
-    time: { type: String, required: true },
-  },
-  { timestamps: true }
-);
-
-// Use existing model if already registered to avoid OverwriteModelError during HMR
-const Event: Model<EventDoc> =
-  (mongoose.models.Event as Model<EventDoc> | undefined) ??
-  mongoose.model<EventDoc>("Event", EventSchema);
-
-// Cached connection pattern for Next.js hot-reload/dev
-const MONGODB_URI = process.env.MONGODB_URI;
-
-type MongooseCache = { conn: typeof mongoose | null; promise: Promise<typeof mongoose> | null };
-const globalWithMongoose = global as unknown as { mongoose?: MongooseCache };
-if (!globalWithMongoose.mongoose) {
-  globalWithMongoose.mongoose = { conn: null, promise: null };
-}
-
-async function dbConnect(): Promise<typeof mongoose> {
-  if (!MONGODB_URI) {
-    throw new Error("MONGODB_URI is not configured in environment variables");
-  }
-  const cache = globalWithMongoose.mongoose!;
-  if (cache.conn) return cache.conn;
-  if (!cache.promise) {
-    cache.promise = mongoose.connect(MONGODB_URI, { dbName: process.env.MONGODB_DB || undefined });
-  }
-  cache.conn = await cache.promise;
-  return cache.conn;
-}
-
-// Small helper to validate slug format (lowercase letters, numbers, dashes)
-function isValidSlug(value: unknown): value is string {
-  return typeof value === "string" && /^[a-z0-9-]{1,100}$/.test(value);
-}
-
-// GET /api/events/[slug]
-export async function GET(_req: Request, context: { params: { slug?: string } }) {
+/**
+ * GET /api/events/[slug]
+ * Fetches a single events by its slug
+ */
+export async function GET(
+  req: NextRequest,
+  { params }: RouteParams
+): Promise<NextResponse> {
   try {
-    const slug = context?.params?.slug;
+    // Connect to database
+    await connectDB();
 
-    // Validate presence and format of slug
-    if (!slug) {
+    // Await and extract slug from params
+    const { slug } = await params;
+
+    // Validate slug parameter
+    if (!slug || typeof slug !== 'string' || slug.trim() === '') {
       return NextResponse.json(
-        { success: false as const, error: { code: "MISSING_SLUG", message: "Parameter 'slug' is required." } },
+        { message: 'Invalid or missing slug parameter' },
         { status: 400 }
       );
     }
-    if (!isValidSlug(slug)) {
-      return NextResponse.json(
-        { success: false as const, error: { code: "INVALID_SLUG", message: "Parameter 'slug' must be a lowercase slug (a-z, 0-9, -)." } },
-        { status: 400 }
-      );
-    }
 
-    // Connect to the database and query by slug
-    await dbConnect();
-    const doc = await Event.findOne({ slug }).lean().exec();
+    // Sanitize slug (remove any potential malicious input)
+    const sanitizedSlug = slug.trim().toLowerCase();
 
-    if (!doc) {
+    // Query events by slug
+    const event = await Event.findOne({ slug: sanitizedSlug }).lean();
+
+    // Handle events not found
+    if (!event) {
       return NextResponse.json(
-        { success: false as const, error: { code: "NOT_FOUND", message: "Event not found." } },
+        { message: `Event with slug '${sanitizedSlug}' not found` },
         { status: 404 }
       );
     }
 
-    // Map the document to the public shape to ensure a stable API
-    const event: EventPublic = {
-      image: String((doc as unknown as EventPublic).image),
-      title: String((doc as unknown as EventPublic).title),
-      slug: String((doc as unknown as EventPublic).slug),
-      location: String((doc as unknown as EventPublic).location),
-      date: String((doc as unknown as EventPublic).date),
-      time: String((doc as unknown as EventPublic).time),
-    };
-
+    // Return successful response with events data
     return NextResponse.json(
-      { success: true as const, data: event },
-      {
-        status: 200,
-        headers: {
-          // Allow intermediate caches on the server (e.g., Vercel) to cache briefly
-          "Cache-Control": "public, s-maxage=60, stale-while-revalidate=300",
-        },
-      }
+      { message: 'Event fetched successfully', event },
+      { status: 200 }
     );
-  } catch (err) {
-    console.error("[GET] /api/events/[slug] error", err);
+  } catch (error) {
+    // Log error for debugging (only in development)
+    if (process.env.NODE_ENV === 'development') {
+      console.error('Error fetching events by slug:', error);
+    }
+
+    // Handle specific error types
+    if (error instanceof Error) {
+      // Handle database connection errors
+      if (error.message.includes('MONGODB_URI')) {
+        return NextResponse.json(
+          { message: 'Database configuration error' },
+          { status: 500 }
+        );
+      }
+
+      // Return generic error with error message
+      return NextResponse.json(
+        { message: 'Failed to fetch events', error: error.message },
+        { status: 500 }
+      );
+    }
+
+    // Handle unknown errors
     return NextResponse.json(
-      { success: false as const, error: { code: "INTERNAL_SERVER_ERROR", message: "An unexpected error occurred." } },
+      { message: 'An unexpected error occurred' },
       { status: 500 }
     );
   }
